@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual env
+venv/
+env/
+.venv/
+
+# Data — không push lên git (quá lớn)
+data/
+!data/.gitkeep
+
+# Experiments — checkpoints & logs không push
+experiments/
+!experiments/.gitkeep
+
+# Notebooks output
+notebooks/**/*.ipynb
+!notebooks/kaggle_tpu.ipynb
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LaTeX build artifacts
+paper/*.pdf
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.bbl
+paper/*.blg
+# Nhưng giữ lại .tex source
+!paper/*.tex
+
+# Papers folder (PDF references — dùng git-lfs hoặc exclude)
+papers/*.pdf
+
+# Misc
+*.pt
+*.pth
+*.ckpt
+*.egg
+.env
