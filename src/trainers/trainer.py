@@ -1,33 +1,19 @@
 """
-Trainer — single phase, 20 epochs
-
-Cách dùng:
-    from src.trainers.trainer import Trainer, TrainConfig
-    cfg     = TrainConfig(dataset='coco', total_epochs=20)
-    trainer = Trainer(model, loss_fn, cfg)
-    trainer.train()
+trainer.py — TensorFlow training loop (GradientTape).
 """
 
 import os
 import math
 import time
 import datetime
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
+import numpy as np
+import tensorflow as tf
+import keras
 from dataclasses import dataclass, field
 from tqdm import tqdm
 
-import torchvision.datasets as dsets
-
 from src.trainers.logger     import Logger
 from src.trainers.visualizer import Visualizer
-from src.datasets.aug_dataset import AugmentedDataset
-from src.utils.xla_utils import (
-    xla_available, is_tpu, is_master, xla_print,
-    wrap_dataloader, clip_and_step, mark_step, bf16_context,
-    setup_tpu, shard_model,
-)
 
 
 # ===========================================================================
@@ -39,59 +25,70 @@ class TrainConfig:
     run_name:    str   = "run"
     exp_dir:     str   = "experiments"
     data_root:   str   = "data"
-    dataset:     str   = "coco"       # "coco" | "cifar10" | "cifar100" | "stl10"
+    dataset:     str   = "coco"
     img_size:    int   = 128
     q:           int   = 3
-    k:           int   = 2
-    batch_size:  int   = 16
-    grad_accum:  int   = 4            # effective batch = batch_size * grad_accum
-    num_workers: int   = 8
-    prefetch_factor: int = 2
-    device:      str   = "cuda"
+    k:           int   = 0
+    batch_size:  int   = 256
+    grad_accum:  int   = 1
+    num_workers: int   = 8      # parallel map calls for tf.data
+    prefetch_factor: int = 4
+    device:      str   = "auto"   # "auto" | "cpu" | "gpu"
     use_amp:     bool  = True
-    compile_model: bool = False
-    use_vae:     bool  = True   # False = bỏ decoder + KL, chỉ train contrastive losses
+    compile_model: bool = False   # tf.function JIT (auto via @tf.function)
+    use_vae:     bool  = False    # False = skip decoder, contrastive only
 
-    total_epochs: int  = 20
+    total_epochs: int   = 30
     lr:           float = 3e-4
     weight_decay: float = 1e-4
+    warmup_epochs: int  = 5
 
-    # Loss weights (single phase, active from epoch 1)
     beta:          float = 0.1
     lambda_union:  float = 1.0
     lambda_sparse: float = 0.5
     lambda_ortho:  float = 0.1
     lambda_neg:    float = 0.3
 
-    # Visualization
-    recon_every:  int = 5
-    curves_every: int = 10
-    tsne_every:   int = 999   # tắt mặc định, bật nếu cần
-    log_iter_every: int = 50  # log + update iter_curves.png mỗi N iteration
+    # Linear probe evaluation
+    eval_every:        int  = 10
+    eval_dataset:      str  = 'cifar10'
+    eval_data_root:    str  = 'data'
+    eval_probe_epochs: int  = 20
+
+    # Logging / visualization
+    recon_every:    int = 5
+    curves_every:   int = 10
+    tsne_every:     int = 999
+    log_iter_every: int = 50
+
+    # Compatibility fields (used by tests / main.py)
+    dim_inter:  int = 128
+    dim_unique: int = 64
+    latent_ch:  int = 192
 
 
 # ===========================================================================
 # Metrics
 # ===========================================================================
 
-@torch.no_grad()
-def compute_metrics(union_feat: torch.Tensor,
-                    sparse_feat: torch.Tensor,
+def compute_metrics(union_feat: np.ndarray,
+                    sparse_feat: np.ndarray,
                     mse: float,
                     q: int) -> dict:
+    """Compute decomposition quality metrics from numpy arrays."""
     B = union_feat.shape[0] // q
-    u = union_feat.view(B, q, -1)
-    s = sparse_feat.view(B, q, -1)
+    u = union_feat.reshape(B, q, -1)
+    s = sparse_feat.reshape(B, q, -1)
 
-    u_sims = [(u[:, i] * u[:, j]).sum(dim=1)
-              for i in range(q) for j in range(i+1, q)]
-    s_sims = [(s[:, i] * s[:, j]).sum(dim=1)
-              for i in range(q) for j in range(i+1, q)]
+    u_sims = [(u[:, i] * u[:, j]).sum(axis=1)
+              for i in range(q) for j in range(i + 1, q)]
+    s_sims = [(s[:, i] * s[:, j]).sum(axis=1)
+              for i in range(q) for j in range(i + 1, q)]
 
-    union_consistency = torch.stack(u_sims).mean().item()
-    sparse_divergence = 1.0 - torch.stack(s_sims).mean().item()
-    ortho_score       = (u.mean(dim=2) * s.mean(dim=2)).abs().mean().item()
-    psnr              = 10 * math.log10(1.0 / (mse + 1e-8))
+    union_consistency = float(np.stack(u_sims).mean())
+    sparse_divergence = float(1.0 - np.stack(s_sims).mean())
+    ortho_score       = float(np.abs(u.mean(axis=2) * s.mean(axis=2)).mean())
+    psnr              = float(10 * math.log10(1.0 / (mse + 1e-8)))
 
     return {
         'union_consistency': union_consistency,
@@ -102,16 +99,45 @@ def compute_metrics(union_feat: torch.Tensor,
 
 
 # ===========================================================================
+# LR Schedule: warmup + cosine decay
+# ===========================================================================
+
+class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, peak_lr, warmup_steps, total_steps, min_lr=1e-6):
+        self.peak_lr      = float(peak_lr)
+        self.warmup_steps = float(warmup_steps)
+        self.total_steps  = float(total_steps)
+        self.min_lr       = float(min_lr)
+
+    def __call__(self, step):
+        step  = tf.cast(step, tf.float32)
+        ws    = tf.constant(self.warmup_steps, tf.float32)
+        ts    = tf.constant(self.total_steps,  tf.float32)
+        pk    = tf.constant(self.peak_lr,      tf.float32)
+        mn    = tf.constant(self.min_lr,       tf.float32)
+
+        warmup_lr = mn + (pk - mn) * step / tf.maximum(ws, 1.0)
+        t         = tf.clip_by_value((step - ws) / tf.maximum(ts - ws, 1.0), 0.0, 1.0)
+        cosine_lr = mn + 0.5 * (pk - mn) * (1.0 + tf.cos(np.pi * t))
+        return tf.where(step < ws, warmup_lr, cosine_lr)
+
+    def get_config(self):
+        return {
+            'peak_lr': self.peak_lr, 'warmup_steps': self.warmup_steps,
+            'total_steps': self.total_steps, 'min_lr': self.min_lr,
+        }
+
+
+# ===========================================================================
 # Trainer
 # ===========================================================================
 
 class Trainer:
 
     def __init__(self, model, loss_fn, cfg: TrainConfig):
-        self.model   = model.to(cfg.device)
+        self.model   = model
         self.loss_fn = loss_fn
         self.cfg     = cfg
-        self.device  = torch.device(cfg.device)
 
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.run_dir  = os.path.join(cfg.exp_dir, f"{cfg.run_name}_{ts}")
@@ -123,37 +149,16 @@ class Trainer:
 
         self._best_total = float('inf')
         self._best_union = -float('inf')
-        self._global_iter = 0   # tổng số iteration từ đầu training
+        self._global_iter = 0
 
-        # Speedup: channels_last memory layout — 10-30% faster trên NVIDIA GPU
-        # TPU không hỗ trợ channels_last → skip
-        if not is_tpu():
-            self.model = self.model.to(memory_format=torch.channels_last)
-            torch.backends.cudnn.benchmark = True
-        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
-        # Multi-GPU (T4 x2): DataParallel tu dong chia batch qua cac GPU
-        if not is_tpu() and torch.cuda.device_count() > 1:
-            self.model = torch.nn.DataParallel(self.model)
-            self.logger.info(f'DataParallel: {torch.cuda.device_count()} GPUs')
-        # TPU v5e: dùng bfloat16 qua bf16_context() thay cho GradScaler/AMP
-        # GPU: dùng float16 GradScaler như cũ
-        use_amp_gpu = cfg.use_amp and not is_tpu()
-        # torch.cuda.amp.GradScaler works on PyTorch >= 1.6 (including Kaggle 2.1.x)
-        # torch.amp.GradScaler only available on PyTorch >= 2.3
-        if use_amp_gpu:
-            self.scaler = torch.cuda.amp.GradScaler()
-        else:
-            self.scaler = None
+        self._probe_history:  list = []
+        self._metric_history: list = []
 
-        # torch.compile: tự động bật trên CUDA nếu PyTorch >= 2.0 và được yêu cầu.
-        # Cho ~20-40% speedup trên RTX series. Không dùng cho TPU (XLA tự JIT).
-        should_compile = cfg.compile_model and not is_tpu() and torch.cuda.is_available()
-        if should_compile:
-            try:
-                self.model = torch.compile(self.model, mode='reduce-overhead')
-                print('[Trainer] torch.compile: ON (reduce-overhead) — first iter sẽ chậm hơn')
-            except Exception as e:
-                print(f'[Trainer] torch.compile unavailable: {e}')
+        # Setup device / mixed precision
+        from src.utils.xla_utils import setup_mixed_precision, device_info
+        if cfg.use_amp:
+            setup_mixed_precision(use_amp=True)
+        self.logger.info(f"Device: {device_info()}")
 
         self._write_config()
 
@@ -161,11 +166,11 @@ class Trainer:
     def _write_config(self):
         cfg = self.cfg
         lines = [
-            f"Run:      {self.run_dir}",
-            f"Dataset:  {cfg.dataset}  img_size={cfg.img_size}",
+            f"Run:     {self.run_dir}",
+            f"Dataset: {cfg.dataset}  img_size={cfg.img_size}",
             f"q={cfg.q}  k={cfg.k}  batch={cfg.batch_size}  grad_accum={cfg.grad_accum}",
-            f"Epochs:   {cfg.total_epochs}   lr={cfg.lr}   wd={cfg.weight_decay}",
-            f"AMP:      {cfg.use_amp}",
+            f"Epochs:  {cfg.total_epochs}   lr={cfg.lr}   wd={cfg.weight_decay}",
+            f"AMP:     {cfg.use_amp}",
             f"β={cfg.beta}  λu={cfg.lambda_union}  λs={cfg.lambda_sparse}"
             f"  λo={cfg.lambda_ortho}  λn={cfg.lambda_neg}",
         ]
@@ -176,231 +181,310 @@ class Trainer:
     # ------------------------------------------------------------------
     def _build_loader(self):
         cfg = self.cfg
-        print(f"[Data] Loading dataset '{cfg.dataset}' from {cfg.data_root} ...")
-        if cfg.dataset == 'coco':
-            from src.datasets.aug_dataset import CocoImageDataset
-            base = CocoImageDataset(root=cfg.data_root, split='train')
-        elif cfg.dataset == 'cifar10':
-            base = dsets.CIFAR10(root=cfg.data_root, train=True,
-                                 download=False, transform=None)
+        from src.datasets.aug_dataset import (
+            make_aug_dataset, load_cifar10, load_cifar100,
+            load_images_from_dir,
+        )
+        print(f"[Data] Loading '{cfg.dataset}' from {cfg.data_root} ...")
+
+        if cfg.dataset == 'cifar10':
+            images, _ = load_cifar10(cfg.data_root, train=True)
         elif cfg.dataset == 'cifar100':
-            base = dsets.CIFAR100(root=cfg.data_root, train=True,
-                                  download=False, transform=None)
-        elif cfg.dataset == 'stl10':
-            base = dsets.STL10(root=cfg.data_root, split='unlabeled',
-                               download=False, transform=None)
-        elif cfg.dataset == 'imagenet':
-            import torchvision.datasets as _dsets
-            # ImageFolder scans 1.2M files — có thể mất 2-5 phút trên Kaggle NFS
-            print("[Data] Scanning ImageNet directory (may take 2-5 min on Kaggle)...")
-            base = _dsets.ImageFolder(root=cfg.data_root, transform=None)
+            images, _ = load_cifar100(cfg.data_root, train=True)
+        elif cfg.dataset in ('coco', 'imagenet'):
+            images = load_images_from_dir(cfg.data_root)
         else:
             raise ValueError(f"Unknown dataset: {cfg.dataset}")
 
-        print(f"[Data] Dataset ready: {len(base):,} samples")
-        ds = AugmentedDataset(base, q=cfg.q, k=cfg.k, img_size=cfg.img_size)
-
-        # TPU: workers > 0 can deadlock with MpDeviceLoader → force 0
-        nw = 0 if is_tpu() else cfg.num_workers
-        pf = cfg.prefetch_factor if nw > 0 else None
-
-        loader = DataLoader(
-            ds,
-            batch_size         = cfg.batch_size,
-            shuffle            = True,
-            num_workers        = nw,
-            prefetch_factor    = pf,
-            pin_memory         = not is_tpu(),
-            drop_last          = True,
-            persistent_workers = nw > 0,
+        n = len(images)
+        print(f"[Data] {n:,} samples  →  ~{n // cfg.batch_size:,} steps/epoch")
+        dataset = make_aug_dataset(
+            images, cfg.q, cfg.k, cfg.img_size,
+            batch_size=cfg.batch_size,
+            shuffle_buffer=min(50000, n),
+            prefetch=cfg.prefetch_factor,
         )
-        print(f"[Data] DataLoader ready | workers={nw} prefetch={pf} pin_memory={not is_tpu()}")
-        # Wrap với XLA MpDeviceLoader trên TPU để pipeline data → device
-        return wrap_dataloader(loader, self.device)
+        steps = n // cfg.batch_size   # drop_remainder=True
+        return dataset, steps
 
     # ------------------------------------------------------------------
-    def _set_loss_weights(self):
-        cfg = self.cfg
-        self.loss_fn.beta          = cfg.beta
-        self.loss_fn.lambda_union  = cfg.lambda_union
-        self.loss_fn.lambda_sparse = cfg.lambda_sparse
-        self.loss_fn.lambda_ortho  = cfg.lambda_ortho
-        self.loss_fn.lambda_neg    = cfg.lambda_neg
+    def _setup_train_fn(self, optimizer):
+        """
+        Compile the inner training step with @tf.function.
+        Forward + backward + optimizer update runs as one fused graph — no eager overhead.
+        """
+        model    = self.model
+        loss_fn  = self.loss_fn
+        q        = self.cfg.q
+        img_size = self.cfg.img_size
+        use_vae  = self.cfg.use_vae
+        tvars    = model.trainable_variables
+
+        @tf.function(reduce_retracing=True)
+        def _step(core_imgs):
+            B    = tf.shape(core_imgs)[0]
+            x_bq = tf.reshape(core_imgs, (B * q, img_size, img_size, 3))
+
+            with tf.GradientTape() as tape:
+                recon, mu, logvar, image_feat, union_feat, sparse_feat = \
+                    model(x_bq, skip_decoder=not use_vae, training=True)
+
+                uf = tf.cast(union_feat,  tf.float32)
+                sf = tf.cast(sparse_feat, tf.float32)
+                ff = tf.cast(image_feat,  tf.float32)
+
+                perm      = tf.random.shuffle(tf.range(B))
+                union_neg = tf.reshape(
+                    tf.gather(tf.reshape(uf, (B, q, -1)), perm), (B * q, -1))
+
+                recon_f = tf.cast(recon,  tf.float32) if recon  is not None else None
+                mu_f    = tf.cast(mu,     tf.float32) if mu     is not None else None
+                lv_f    = tf.cast(logvar, tf.float32) if logvar is not None else None
+
+                total, details = loss_fn(
+                    recon_f, tf.cast(x_bq, tf.float32), mu_f, lv_f,
+                    ff, uf, sf, union_neg, q=q,
+                )
+
+            grads = tape.gradient(total, tvars)
+            grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, tvars)]
+            optimizer.apply_gradients(zip(grads, tvars))
+
+            # Stack all scalars into one tensor → single GPU→CPU transfer per step
+            keys = ['total', 'vae', 'mse', 'kl', 'union', 'sparse', 'ortho', 'neg', 'uniform', 'aux']
+            scalar_vec = tf.stack([details[k] for k in keys])
+            return scalar_vec, uf, sf, ff, x_bq, recon_f
+
+        _KEYS = ['total', 'vae', 'mse', 'kl', 'union', 'sparse', 'ortho', 'neg', 'uniform', 'aux']
+
+        def unpack(scalar_vec):
+            vals = scalar_vec.numpy()
+            return {k: float(v) for k, v in zip(_KEYS, vals)}
+
+        return _step, unpack
 
     # ------------------------------------------------------------------
-    def _train_epoch(self, loader, optimizer, epoch: int):
-        self.model.train()
-        cfg = self.cfg
+    def _build_optimizer(self, steps_per_epoch: int):
+        cfg      = self.cfg
+        total    = cfg.total_epochs * steps_per_epoch
+        warmup   = cfg.warmup_epochs * steps_per_epoch
+        schedule = WarmupCosineDecay(
+            peak_lr=cfg.lr, warmup_steps=warmup,
+            total_steps=total, min_lr=1e-6,
+        )
+        return keras.optimizers.AdamW(
+            learning_rate=schedule,
+            weight_decay=cfg.weight_decay,
+            clipnorm=0.5,
+        )
 
-        acc = {k: 0.0 for k in ['total','vae','mse','kl','union','sparse','ortho','neg','uniform']}
-        n_batches    = len(loader)
-        viz_inputs   = viz_recons = viz_union = viz_sparse = viz_imgfeat = None
-        nan_skipped  = 0
-
-        optimizer.zero_grad()
+    # ------------------------------------------------------------------
+    def _train_epoch(self, loader, optimizer, train_step, unpack, epoch: int):
+        cfg      = self.cfg
+        q        = cfg.q
+        img_size = cfg.img_size
+        acc      = {k: 0.0 for k in [
+            'total', 'vae', 'mse', 'kl', 'union', 'sparse', 'ortho', 'neg', 'uniform', 'aux'
+        ]}
+        n_batches = 0
+        nan_skipped = 0
+        viz_union = viz_sparse = viz_inputs = viz_recon = viz_imgfeat = None
 
         pbar = tqdm(loader, desc=f"Ep {epoch:03d}/{cfg.total_epochs}",
                     leave=False, dynamic_ncols=True)
 
-        for batch_idx, (core_imgs, neg_imgs) in enumerate(pbar):
-            B, q, C, H, W = core_imgs.shape
-            use_inbatch_neg = (neg_imgs.numel() == 0)  # k=0 → in-batch negatives
+        # Update tqdm every N steps to avoid stalling GPU
+        _POSTFIX_EVERY = 20
+        _last_postfix  = {'loss': '?', 'union': '?', 'sparse': '?'}
 
-            _mf = torch.channels_last if not is_tpu() else torch.contiguous_format
-            x_bq = core_imgs.view(B * q, C, H, W).to(
-                cfg.device, non_blocking=not is_tpu(), memory_format=_mf)
+        for step, (core_imgs, _neg_imgs) in enumerate(pbar):
+            # ── compiled GPU step (forward + backward + optimizer) ─────────
+            scalar_vec, uf, sf, ff, x_bq, recon_f = train_step(core_imgs)
 
-            with bf16_context():  # bfloat16 trên TPU v5e, float16 trên GPU, no-op trên CPU
-                recon, mu, logvar, image_feat, union_feat, sparse_feat = \
-                    self.model(x_bq, skip_decoder=not cfg.use_vae)
-
-                if use_inbatch_neg:
-                    # In-batch negatives: shuffle các ảnh trong batch làm negative
-                    # Không tốn disk IO, chuẩn SimCLR style
-                    perm = torch.randperm(B, device=self.device)
-                    union_neg = union_feat.view(B, q, -1)[perm].view(B * q, -1).detach()
-                else:
-                    k_ = neg_imgs.shape[1]
-                    x_bk = neg_imgs.view(B * k_, C, H, W).to(
-                        cfg.device, non_blocking=True, memory_format=torch.channels_last)
-                    with torch.no_grad():
-                        _, _, _, _, union_neg, _ = self.model(x_bk, skip_decoder=not cfg.use_vae)
-
-            # Cast về float32 để loss ổn định
-            mu_f         = mu.float()
-            logvar_f     = logvar.float() if logvar is not None else None
-            recon_f      = recon.float()  if recon  is not None else None
-            x_bq_f       = x_bq.float()
-            image_feat_f = image_feat.float()
-            union_feat_f = union_feat.float()
-            sparse_feat_f= sparse_feat.float()
-            union_neg_f  = union_neg.float()
-
-            total, details = self.loss_fn(
-                recon_f, x_bq_f, mu_f, logvar_f,
-                image_feat_f, union_feat_f, sparse_feat_f, union_neg_f,
-            )
-
-            if not torch.isfinite(total):
-                nan_skipped += 1
-                optimizer.zero_grad()
-                continue  # không gọi scaler.update() — chưa có backward pass
-
-            total_s = total / cfg.grad_accum
-            if self.scaler:
-                self.scaler.scale(total_s).backward()
-            else:
-                total_s.backward()
-
-            if (batch_idx + 1) % cfg.grad_accum == 0 or (batch_idx + 1) == n_batches:
-                clip_and_step(optimizer, self.model, self.scaler, max_norm=0.5)
-
-                # Kiểm tra NaN trong weights sau step (GPU only — TPU không cần)
-                if not is_tpu() and any(not p.isfinite().all()
-                       for p in self.model.parameters() if p.requires_grad):
-                    self.logger.info(
-                        f'  [CRITICAL] NaN in weights at batch {batch_idx}, '
-                        f'restoring from last good checkpoint')
-                    _last_good = os.path.join(self.ckpt_dir, 'checkpoint_latest.pt')
-                    if os.path.exists(_last_good):
-                        ckpt = torch.load(_last_good, map_location=self.device)
-                        self.model.load_state_dict(ckpt['model_state_dict'])
-                    nan_skipped += 1
-                    optimizer.zero_grad()
-                    continue
-
-                optimizer.zero_grad()
-
-            for k_, v in details.items():
-                acc[k_] += v / n_batches
-
-            # Per-iteration logging + graph update
             self._global_iter += 1
-            if self._global_iter % cfg.log_iter_every == 0:
-                lr_cur = optimizer.param_groups[0]['lr']
-                # Tính quick batch metrics từ union/sparse feat hiện tại
-                with torch.no_grad():
-                    uf = union_feat.float().view(B, q, -1)
-                    sf = sparse_feat.float().view(B, q, -1)
-                    u_sim = (uf[:, 0] * uf[:, -1]).sum(-1).mean().item()
-                    s_sim = (sf[:, 0] * sf[:, -1]).sum(-1).mean().item()
-                    batch_metrics = {
-                        'union_consistency': u_sim,
-                        'sparse_divergence': 1.0 - s_sim,
-                        'ortho_score': (uf.mean(2) * sf.mean(2)).abs().mean().item(),
+            n_batches += 1
+
+            # ── CPU sync: one transfer for all scalars ─────────────────────
+            do_log     = cfg.log_iter_every > 0 and self._global_iter % cfg.log_iter_every == 0
+            do_postfix = step % _POSTFIX_EVERY == 0
+            do_viz     = viz_union is None
+
+            if do_log or do_postfix or do_viz:
+                details = unpack(scalar_vec)          # single GPU→CPU transfer
+
+                if not np.isfinite(details['total']):
+                    nan_skipped += 1
+
+                for k_, v in details.items():
+                    acc[k_] += v
+
+                if do_postfix:
+                    _last_postfix = {
+                        'loss':   f"{details['total']:.3f}",
+                        'union':  f"{details['union']:.3f}",
+                        'sparse': f"{details['sparse']:.3f}",
                     }
-                self.logger.log_iter(
-                    epoch, cfg.total_epochs,
-                    batch_idx, n_batches,
-                    self._global_iter,
-                    details, batch_metrics, lr_cur,
-                    use_vae=cfg.use_vae,
-                )
-                self.viz.record_iter(self._global_iter, epoch, details, batch_metrics)
-                self.viz.save_iter_curves(self._global_iter)
+                    pbar.set_postfix(ordered_dict=_last_postfix, refresh=False)
 
-            # details đã là Python float → không cần .item(), không gây GPU sync
-            if cfg.use_vae:
-                pbar.set_postfix(ordered_dict={
-                    'loss'  : f"{details['total']:.3f}",
-                    'mse'   : f"{details['mse']:.3f}",
-                    'union' : f"{details['union']:.3f}",
-                    'sparse': f"{details['sparse']:.3f}",
-                }, refresh=False)
+                if do_log:
+                    uf_np = uf.numpy()
+                    sf_np = sf.numpy()
+                    bm = {
+                        'union_consistency': float(
+                            (uf_np[:q] * uf_np[-q:]).sum(axis=1).mean()),
+                        'sparse_divergence': float(
+                            1.0 - (sf_np[:q] * sf_np[-q:]).sum(axis=1).mean()),
+                        'ortho_score': float(np.abs(
+                            uf_np.reshape(-1, q, uf_np.shape[-1]).mean(2) *
+                            sf_np.reshape(-1, q, sf_np.shape[-1]).mean(2)
+                        ).mean()),
+                    }
+                    lr_val = float(self._optimizer_lr(optimizer))
+                    self.logger.log_iter(
+                        epoch, cfg.total_epochs, step, -1, self._global_iter,
+                        details, bm, lr_val, use_vae=cfg.use_vae,
+                    )
+                    self.viz.record_iter(self._global_iter, epoch, details, bm)
+                    self.viz.save_iter_curves(self._global_iter)
+
+                if do_viz:
+                    viz_union   = uf[:q].numpy()
+                    viz_sparse  = sf[:q].numpy()
+                    viz_imgfeat = ff[:q].numpy()
+                    viz_inputs  = x_bq[:q].numpy()
+                    viz_recon   = recon_f[:q].numpy() if recon_f is not None else None
             else:
-                pbar.set_postfix(ordered_dict={
-                    'loss'  : f"{details['total']:.3f}",
-                    'union' : f"{details['union']:.3f}",
-                    'sparse': f"{details['sparse']:.3f}",
-                    'ortho' : f"{details['ortho']:.3f}",
-                }, refresh=False)
-
-            # Lưu batch đầu cho viz
-            if viz_inputs is None:
-                with torch.no_grad():
-                    viz_inputs  = x_bq[:q].float().cpu()
-                    viz_recons  = recon[:q].float().cpu() if recon is not None else None
-                    viz_union   = union_feat[:q].float()
-                    viz_sparse  = sparse_feat[:q].float()
-                    viz_imgfeat = image_feat[:q].float()
+                # No sync needed — accumulate TF scalars directly
+                scalar_np = scalar_vec.numpy()
+                for i, k in enumerate(['total', 'vae', 'mse', 'kl', 'union',
+                                        'sparse', 'ortho', 'neg', 'uniform', 'aux']):
+                    acc[k] += float(scalar_np[i])
 
         if nan_skipped > 0:
             self.logger.info(f"  [WARN] Epoch {epoch}: {nan_skipped} NaN batches skipped")
 
-        # Nếu toàn bộ batch bị NaN, trả về placeholder zeros để không crash metrics
         if viz_union is None:
-            q_ = cfg.q
-            # Lấy dim từ model nếu có, fallback về 1
-            dim_u = getattr(self.model, 'dim_inter',  1)
-            dim_s = getattr(self.model, 'dim_unique', 1)
-            viz_union   = torch.zeros(q_, dim_u)
-            viz_sparse  = torch.zeros(q_, dim_s)
-            viz_inputs  = torch.zeros(q_, 3, cfg.img_size, cfg.img_size)
-            viz_imgfeat = torch.zeros(q_, 1)
-            self.logger.info(f"  [WARN] Epoch {epoch}: ALL batches NaN! Placeholder used.")
+            viz_union   = np.zeros((q, cfg.dim_inter))
+            viz_sparse  = np.zeros((q, cfg.dim_unique))
+            viz_imgfeat = np.zeros((q, 1))
+            viz_inputs  = np.zeros((q, img_size, img_size, 3))
 
-        return acc, viz_inputs, viz_recons, viz_union, viz_sparse, viz_imgfeat
+        if n_batches > 0:
+            for k_ in acc:
+                acc[k_] /= n_batches
+
+        return acc, viz_inputs, viz_recon, viz_union, viz_sparse, viz_imgfeat
 
     # ------------------------------------------------------------------
-    def _save_checkpoint(self, epoch, optimizer, scheduler, metrics, tag):
-        torch.save({
-            'epoch':               epoch,
-            'model_state_dict':    self.model.state_dict(),
-            'optimizer_state_dict':optimizer.state_dict(),
-            'scheduler_state_dict':scheduler.state_dict() if scheduler else None,
-            'metrics':             metrics,
-        }, os.path.join(self.ckpt_dir, f'checkpoint_{tag}.pt'))
+    @staticmethod
+    def _optimizer_lr(opt) -> float:
+        """Get current LR from optimizer (handles LR schedule)."""
+        try:
+            lr = opt.learning_rate
+            if callable(lr):
+                return float(lr(opt.iterations))
+            return float(lr)
+        except Exception:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    def _save_checkpoint(self, epoch, optimizer, metrics, tag):
+        weights_path = os.path.join(self.ckpt_dir, f'weights_{tag}.keras')
+        self.model.save_weights(weights_path)
+        # Save metadata
+        import json
+        meta = {'epoch': epoch, 'metrics': metrics}
+        with open(os.path.join(self.ckpt_dir, f'meta_{tag}.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+    # ------------------------------------------------------------------
+    def _get_dim_inter(self) -> int:
+        return getattr(self.model, 'dim_inter', self.cfg.dim_inter)
+
+    # ------------------------------------------------------------------
+    def _run_eval(self, epoch: int):
+        from src.eval.linear_probe import run_linear_probe
+        cfg = self.cfg
+        if cfg.eval_every <= 0:
+            return None
+        self.logger.info(f"\n  ── Linear Probe eval (epoch {epoch}) ──")
+        try:
+            result = run_linear_probe(
+                model         = self.model,
+                dataset       = cfg.eval_dataset,
+                data_root     = cfg.eval_data_root,
+                img_size      = cfg.img_size,
+                dim_inter     = self._get_dim_inter(),
+                probe_epochs  = cfg.eval_probe_epochs,
+                verbose       = True,
+            )
+        except Exception as e:
+            self.logger.info(f"  [LinearProbe] ERROR: {e}")
+            return None
+        result['epoch']   = epoch
+        result['dataset'] = cfg.eval_dataset
+        self._probe_history.append(result)
+        self.logger.log_probe(epoch, result,
+                              dataset=cfg.eval_dataset,
+                              probe_epochs=cfg.eval_probe_epochs)
+        return result
+
+    # ------------------------------------------------------------------
+    def _print_final_summary(self):
+        cfg = self.cfg
+        sep = '=' * 68
+        bar = '-' * 68
+        lines = [
+            f"\n{sep}",
+            f"  TRAINING COMPLETE — Paper-Ready Summary",
+            f"{sep}",
+            f"  Dataset : {cfg.dataset}  img={cfg.img_size}px  q={cfg.q}  k={cfg.k}",
+            f"  Epochs  : {cfg.total_epochs}  lr={cfg.lr}  warmup={cfg.warmup_epochs}",
+            f"  Results : {self.run_dir}",
+            bar,
+        ]
+        if self._metric_history:
+            best_m = max(self._metric_history,
+                         key=lambda x: x.get('union_consistency', 0))
+            ep  = best_m['epoch']
+            uc  = best_m.get('union_consistency', 0)
+            sd  = best_m.get('sparse_divergence', 0)
+            os_ = best_m.get('ortho_score', 1)
+            lines += [
+                f"  Best Decomposition Quality (epoch {ep:03d}):",
+                f"    union_consistency : {uc:.4f}  {'✓' if uc >= 0.85 else '✗ (target >0.85)'}",
+                f"    sparse_divergence : {sd:.4f}  {'✓' if sd >= 0.70 else '✗ (target >0.70)'}",
+                f"    ortho_score       : {os_:.4f}  {'✓' if os_ <= 0.10 else '✗ (target <0.10)'}",
+                bar,
+            ]
+        if self._probe_history:
+            best_p = max(self._probe_history, key=lambda x: x['top1'])
+            ds = self._probe_history[0]['dataset']
+            lines.append(f"  Linear Probe ({ds}, {cfg.eval_probe_epochs}-epoch head):")
+            lines.append(f"  {'Epoch':>6}  {'Top-1':>7}  {'Top-5':>7}  {'Time':>6}")
+            lines.append(f"  {'------':>6}  {'-------':>7}  {'-------':>7}  {'------':>6}")
+            for r in self._probe_history:
+                mark = ' ◀ best' if r['epoch'] == best_p['epoch'] else ''
+                lines.append(
+                    f"  {r['epoch']:>6d}  {r['top1']:>6.2f}%  "
+                    f"{r['top5']:>6.2f}%  {r['time_s']:>5.0f}s{mark}"
+                )
+            lines += [
+                bar,
+                f"  Best top-1: {best_p['top1']:.2f}%  (epoch {best_p['epoch']:03d})",
+            ]
+        else:
+            lines.append("  Linear Probe: không chạy (--eval-every 0)")
+        lines += [bar, f"  Checkpoints: {self.ckpt_dir}", sep]
+        self.logger.info('\n'.join(lines))
 
     # ------------------------------------------------------------------
     def train(self):
-        cfg      = self.cfg
-        loader   = self._build_loader()
-        self._set_loss_weights()
-
-        optimizer = optim.AdamW(self.model.parameters(),
-                                lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cfg.total_epochs, eta_min=1e-6)
+        cfg    = self.cfg
+        loader, steps_per_epoch = self._build_loader()
+        optimizer = self._build_optimizer(steps_per_epoch)
+        train_step, unpack = self._setup_train_fn(optimizer)
+        self._optimizer_ref = optimizer  # for LR logging
 
         self.logger.info(f"\n{'='*60}\nTraining — {cfg.total_epochs} epochs\n{'='*60}")
         self.logger.print_legend(use_vae=cfg.use_vae)
@@ -408,46 +492,57 @@ class Trainer:
         for epoch in range(1, cfg.total_epochs + 1):
             t0 = time.time()
             details, viz_in, viz_rec, viz_union, viz_sparse, viz_imgfeat = \
-                self._train_epoch(loader, optimizer, epoch)
-            scheduler.step()
+                self._train_epoch(loader, optimizer, train_step, unpack, epoch)
             elapsed = time.time() - t0
 
             metrics = compute_metrics(viz_union, viz_sparse, details['mse'], cfg.q)
-            # Skip recon_psnr khi không có decoder (mse=0 → PSNR vô nghĩa)
             if not cfg.use_vae:
                 metrics['recon_psnr'] = 0.0
-            lr      = optimizer.param_groups[0]['lr']
+            lr_val = self._optimizer_lr(optimizer)
 
-            # Log 1 lần/epoch
             self.logger.log_epoch(epoch, cfg.total_epochs, 1,
-                                  details, metrics, lr, elapsed,
+                                  details, metrics, lr_val, elapsed,
                                   use_vae=cfg.use_vae)
             self.viz.record(epoch, 1, details, metrics)
+            self._metric_history.append({'epoch': epoch, **metrics})
 
             # Visualizations
             if epoch % cfg.recon_every == 0 or epoch == 1:
-                if viz_rec is not None:
-                    self.viz.save_recon(epoch, viz_in, viz_rec, metrics['recon_psnr'])
+                if viz_rec is not None and viz_in is not None:
+                    # Convert NHWC numpy to torch-compatible for visualizer
+                    import torch
+                    in_t  = torch.from_numpy(viz_in.transpose(0, 3, 1, 2))
+                    rec_t = torch.from_numpy(viz_rec.transpose(0, 3, 1, 2))
+                    self.viz.save_recon(epoch, in_t, rec_t, metrics['recon_psnr'])
             if epoch % cfg.curves_every == 0:
                 self.viz.save_loss_curves(epoch)
                 self.viz.save_metric_curves(epoch)
-                self.viz.save_similarity_heatmaps(epoch, viz_imgfeat, viz_union, viz_sparse)
-            if epoch % cfg.tsne_every == 0:
-                labels = [f'aug{i+1}' for i in range(cfg.q)] * (viz_union.shape[0] // cfg.q)
-                self.viz.save_tsne(epoch, viz_union,  labels, 'Union',  f'union_{epoch:04d}.png')
-                self.viz.save_tsne(epoch, viz_sparse, labels, 'Sparse', f'sparse_{epoch:04d}.png')
+                import torch
+                imgf_t = torch.from_numpy(viz_imgfeat)
+                uf_t   = torch.from_numpy(viz_union)
+                sf_t   = torch.from_numpy(viz_sparse)
+                self.viz.save_similarity_heatmaps(epoch, imgf_t, uf_t, sf_t)
 
-            # Checkpoints — lưu từng epoch + best
-            self._save_checkpoint(epoch, optimizer, scheduler, metrics, f'epoch_{epoch:03d}')
-            self._save_checkpoint(epoch, optimizer, scheduler, metrics, 'latest')
+            # Linear probe
+            if cfg.eval_every > 0 and epoch % cfg.eval_every == 0:
+                self._run_eval(epoch)
+
+            # Checkpoints
+            self._save_checkpoint(epoch, optimizer, metrics, f'epoch_{epoch:03d}')
+            self._save_checkpoint(epoch, optimizer, metrics, 'latest')
             if details['total'] < self._best_total:
                 self._best_total = details['total']
-                self._save_checkpoint(epoch, optimizer, scheduler, metrics, 'best_total')
+                self._save_checkpoint(epoch, optimizer, metrics, 'best_total')
             if metrics['union_consistency'] > self._best_union:
                 self._best_union = metrics['union_consistency']
-                self._save_checkpoint(epoch, optimizer, scheduler, metrics, 'best_union')
+                self._save_checkpoint(epoch, optimizer, metrics, 'best_union')
 
         self.viz.save_loss_curves(epoch)
         self.viz.save_metric_curves(epoch)
-        self.logger.info(f"\nDone. Results: {self.run_dir}")
+
+        if cfg.eval_every > 0 and epoch % cfg.eval_every != 0:
+            self._run_eval(epoch)
+
+        self._print_final_summary()
+        self.logger.info(f"Results: {self.run_dir}")
         self.logger.close()

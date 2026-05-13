@@ -1,382 +1,214 @@
-# Losses cho Augmentation-Aware Intersect-Union Decomposition
+# Losses — Augmentation-Aware Intersect-Union Decomposition (TensorFlow)
 #
-# Inputs cần có:
-#   rec_img:       (B, 3, H, W)          — ảnh reconstruct từ decoder
-#   img:           (B, 3, H, W)          — ảnh gốc (pixel ∈ [0,1])
-#   mu, logvar:    (B, latent_ch, H/8, W/8) — VAE latent params
-#   image_feat:    (B*q, feat_dim)        — aug similarity signal (L2-norm)
-#   union_feat:    (B*q, dim_union)       — union features (L2-norm)
-#   sparse_feat:   (B*q, dim_sparse)      — sparse features (L2-norm)
-#   union_neg:     (B*k, dim_union)       — union features của negative samples (optional)
-#
-# Terminology:
-#   union  = v_inter  (invariant, shared across augmentations)
-#   sparse = v_unique (equivariant, unique per augmentation)
-#   q = số augmented versions của 1 ảnh
-#   k = số negative (auxiliary) images
-#
-# Loss tổng:
-#   L = L_vae + λ_u·L_union + λ_s·L_sparse + λ_o·L_ortho + λ_n·L_neg
-#
-# Novelty chính: Aug-aware weighting w_ij
-#   w_ij = cosine_sim(image_feat_i, image_feat_j)
-#   → Union loss: weight w_ij  (aug tương tự → kéo mạnh hơn)
-#   → Sparse loss: weight (1-w_ij) với adaptive margin m_ij = base_margin * (1-w_ij)
-#     (aug khác nhau → đẩy mạnh hơn, margin lớn hơn)
+# Inputs:
+#   rec_img:     (B, H, W, 3)           — ảnh reconstruct (None nếu skip_decoder)
+#   img:         (B, H, W, 3)           — ảnh gốc
+#   mu, logvar:  (B, latent_ch)         — VAE latent params
+#   image_feat:  (B*q, feat_dim)        — aug similarity signal (L2-norm)
+#   union_feat:  (B*q, dim_inter)       — invariant features (L2-norm)
+#   sparse_feat: (B*q, dim_unique)      — equivariant features (L2-norm)
+#   union_neg:   (B*q, dim_inter)       — negative features (in-batch)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tensorflow as tf
+import keras
 
 
 # ===========================================================================
 # 1. VAE LOSS
 # ===========================================================================
 
-def vae_loss_mse(rec_img: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
-    """
-    Reconstruction loss: pixel-wise MSE.
-    rec_img và img phải cùng shape (B, 3, H, W), giá trị ∈ [0, 1].
-    """
-    return F.mse_loss(rec_img, img)
+def vae_loss_mse(rec_img, img):
+    return tf.reduce_mean(tf.square(rec_img - img))
 
 
-def vae_loss_kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """
-    KL divergence: KL(q(z|x) || p(z)) với p(z) = N(0, I).
-    logvar clamp [-10, 2] và exp clamp [0, 100] → tránh NaN với AMP (FP16).
-    """
-    logvar_c = logvar.clamp(-10.0, 2.0)
-    return -0.5 * torch.mean(1 + logvar_c - mu.pow(2).clamp(max=100) - logvar_c.exp())
+def vae_loss_kl(mu, logvar):
+    logvar_c = tf.clip_by_value(logvar, -10.0, 2.0)
+    return -0.5 * tf.reduce_mean(
+        1.0 + logvar_c - tf.minimum(tf.square(mu), 100.0) - tf.exp(logvar_c)
+    )
 
 
-def vae_loss(rec_img: torch.Tensor, img: torch.Tensor,
-             mu: torch.Tensor, logvar: torch.Tensor,
-             beta: float = 1.0):
-    """
-    Tổng VAE loss = MSE + β·KL
-    β > 1: β-VAE, disentangle mạnh hơn (thường dùng β=4 hoặc β=8).
-    β = 1: standard VAE.
-
-    Returns: (total, mse, kl)
-    """
+def vae_loss(rec_img, img, mu, logvar, beta=1.0):
     mse = vae_loss_mse(rec_img, img)
     kl  = vae_loss_kl(mu, logvar)
     return mse + beta * kl, mse, kl
 
 
 # ===========================================================================
-# 2. AUG-AWARE WEIGHTING  (novelty chính)
+# 2. UNIFORMITY LOSS
 # ===========================================================================
 
-def aug_similarity_matrix(image_feat: torch.Tensor) -> torch.Tensor:
-    """
-    Tính ma trận similarity w_ij giữa tất cả các cặp augmented versions.
-
-    Args:
-        image_feat: (q, feat_dim) — L2-normalized, đã GAP từ feature_map
-                    q = số augmented versions của 1 ảnh trong 1 batch item
-
-    Returns:
-        W: (q, q) — w_ij ∈ [-1, 1], đã được clamp về [0, 1]
-           w_ij cao → hai augmentation tương tự nhau
-           w_ij thấp → hai augmentation khác nhau nhiều
-
-    Note: image_feat phải L2-normalized trước khi vào hàm này.
-          (VAE.py đã normalize trong ImageFeatBranch)
-    """
-    # cosine similarity giữa mọi cặp
-    W = image_feat @ image_feat.T    # (q, q)
-    return W.clamp(min=0.0)          # clamp về [0,1], bỏ negative sim
-
-
-def uniformity_loss(feat: torch.Tensor, t: float = 2.0) -> torch.Tensor:
-    """
-    Uniformity loss (Wang & Isola 2020): đẩy tất cả features ra xa nhau trên hypersphere.
-    Ngăn chặn collapse khi skip_decoder=True (không có reconstruction gradient).
-
-        L_uniform = log E[exp(-t * ||z_i - z_j||²)]
-                  = log mean(exp(-t * pairwise_dist²))
-
-    feat: (N, D) — L2-normalized features
-    t   : temperature, lớn hơn = đẩy mạnh hơn
-    """
-    sq_dist = 2.0 - 2.0 * (feat @ feat.T)   # pairwise squared L2 (dùng cosine trick)
-    sq_dist = sq_dist.clamp(min=0.0)
-    return sq_dist.mul(-t).exp().mean().log()
+def uniformity_loss(feat, t=2.0):
+    """Uniformity on hypersphere (Wang & Isola 2020). feat: (N, D) L2-normalized."""
+    sq_dist = tf.maximum(2.0 - 2.0 * tf.matmul(feat, tf.transpose(feat)), 0.0)
+    return tf.math.log(tf.reduce_mean(tf.exp(-t * sq_dist)))
 
 
 # ===========================================================================
-# 3. UNION LOSS  (pull union features together, weighted by aug similarity)
+# 3. UNION LOSS  (aug-aware weighting — novelty chính)
 # ===========================================================================
 
-def union_loss(union_feat: torch.Tensor,
-               image_feat: torch.Tensor) -> torch.Tensor:
+def union_loss(union_feat, image_feat, q=3):
     """
-    Kéo các union features lại gần nhau, weight theo aug similarity.
+    Kéo union features lại gần nhau, weight theo aug similarity.
+    Per-image computation với (B, q, q) bmm — không mix cross-image.
 
-    L_union = Σ_{i≠j} w_ij · (1 - cos(union_i, union_j))
-            / Σ_{i≠j} w_ij          ← normalize để loss scale ổn định
-
-    Aug tương tự (w_ij cao) → kéo mạnh hơn.
-    Aug rất khác nhau (w_ij thấp) → kéo nhẹ hơn (vì dù sao union cũng nên giống).
-
-    Args:
-        union_feat:  (q, dim_union)  — L2-normalized union features
-        image_feat:  (q, feat_dim)   — L2-normalized image features (aug signal)
-
-    Returns:
-        scalar loss
+    L_union = mean_B [ Σ_{i≠j} w_ij · (1 - cos(u_i, u_j)) / Σ_{i≠j} w_ij ]
     """
-    q = union_feat.size(0)
-    W = aug_similarity_matrix(image_feat)   # (q, q)
+    B = tf.shape(union_feat)[0] // q
+    u = tf.reshape(union_feat, (B, q, -1))   # (B, q, D)
+    f = tf.reshape(image_feat, (B, q, -1))   # (B, q, F)
 
-    # cosine similarity giữa mọi cặp union features
-    cos_sim = union_feat @ union_feat.T     # (q, q), L2-norm → cosine
+    W     = tf.matmul(f, tf.transpose(f, [0, 2, 1]))              # (B, q, q)
+    W     = tf.maximum(W, 0.0)
+    cos_s = tf.matmul(u, tf.transpose(u, [0, 2, 1]))              # (B, q, q)
 
-    # Loss = weighted (1 - cosine_sim), chỉ tính i ≠ j
-    mask = ~torch.eye(q, dtype=torch.bool, device=union_feat.device)
-    w    = W[mask]              # (q*(q-1),)
-    sim  = cos_sim[mask]        # (q*(q-1),)
+    mask  = 1.0 - tf.eye(q, dtype=W.dtype)                        # (q, q), 0 diagonal
+    w_off = W * mask
+    d_off = (1.0 - cos_s) * mask
 
-    loss = (w * (1 - sim)).sum()
-    denom = w.sum().clamp(min=1e-8)
-    return loss / denom
+    loss  = tf.reduce_sum(w_off * d_off, axis=[1, 2])             # (B,)
+    denom = tf.maximum(tf.reduce_sum(w_off, axis=[1, 2]), 1e-8)   # (B,)
+    return tf.reduce_mean(loss / denom)
 
 
 # ===========================================================================
-# 4. SPARSE LOSS  (push sparse features apart, weighted by aug dissimilarity)
+# 4. SPARSE LOSS
 # ===========================================================================
 
-def sparse_loss(sparse_feat: torch.Tensor,
-                image_feat: torch.Tensor,
-                base_margin: float = 0.5) -> torch.Tensor:
+def sparse_loss(sparse_feat, image_feat, base_margin=0.5, q=3):
     """
-    Đẩy các sparse features ra xa nhau, weight theo aug dissimilarity.
+    Đẩy sparse features ra xa nhau, weight theo aug dissimilarity.
 
-    L_sparse = Σ_{i≠j} (1-w_ij) · max(0, m_ij - cos(sparse_i, sparse_j))
-             / Σ_{i≠j} (1-w_ij)
-
-    Với adaptive margin:
-        m_ij = base_margin * (1 - w_ij)
-        → aug càng khác nhau → margin càng lớn → đẩy mạnh hơn
-        → aug tương tự → margin nhỏ → không ép đẩy quá mức
-
-    Args:
-        sparse_feat:  (q, dim_sparse) — L2-normalized sparse features
-        image_feat:   (q, feat_dim)   — L2-normalized image features
-        base_margin:  float           — base margin (default 0.5)
-
-    Returns:
-        scalar loss
+    L_sparse = mean_B [ Σ_{i≠j} (1-w_ij)·max(0, m_ij - cos(s_i,s_j)) / Σ_{i≠j}(1-w_ij) ]
     """
-    q = sparse_feat.size(0)
-    W = aug_similarity_matrix(image_feat)   # (q, q), w_ij ∈ [0,1]
+    B = tf.shape(sparse_feat)[0] // q
+    s = tf.reshape(sparse_feat, (B, q, -1))
+    f = tf.reshape(image_feat,  (B, q, -1))
 
-    cos_sim = sparse_feat @ sparse_feat.T   # (q, q)
+    W     = tf.maximum(tf.matmul(f, tf.transpose(f, [0, 2, 1])), 0.0)
+    cos_s = tf.matmul(s, tf.transpose(s, [0, 2, 1]))
 
-    mask = ~torch.eye(q, dtype=torch.bool, device=sparse_feat.device)
-    w        = W[mask]              # (q*(q-1),)
-    sim      = cos_sim[mask]        # (q*(q-1),)
-    dis_w    = (1 - w)              # dissimilarity weight
+    dis_w = 1.0 - W
+    m_ij  = base_margin * dis_w
 
-    # Adaptive margin: aug càng khác nhau → margin càng lớn
-    m_ij = base_margin * dis_w      # (q*(q-1),)
+    mask     = 1.0 - tf.eye(q, dtype=W.dtype)
+    dis_w_off= dis_w * mask
+    hinge    = tf.nn.relu(m_ij - cos_s) * mask
 
-    loss  = (dis_w * F.relu(m_ij - sim)).sum()
-    denom = dis_w.sum().clamp(min=1e-8)
-    return loss / denom
+    loss  = tf.reduce_sum(dis_w_off * hinge, axis=[1, 2])
+    denom = tf.maximum(tf.reduce_sum(dis_w_off, axis=[1, 2]), 1e-8)
+    return tf.reduce_mean(loss / denom)
 
 
 # ===========================================================================
-# 5. ORTHOGONALITY LOSS  (union ⊥ sparse — mang thông tin khác nhau)
+# 5. ORTHOGONALITY LOSS
 # ===========================================================================
 
-def ortho_loss(union_feat: torch.Tensor,
-               sparse_feat: torch.Tensor) -> torch.Tensor:
-    """
-    Đảm bảo union và sparse features mang thông tin KHÁC NHAU.
-
-    L_ortho = mean |cos(union_i, sparse_i)|
-            = mean |union_i · sparse_i|   (vì cả hai đã L2-norm)
-
-    Minimize L_ortho → union ⊥ sparse → không overlap thông tin.
-    Dùng |.| vì chỉ cần chúng không tương quan, bất kể dấu.
-
-    Args:
-        union_feat:  (q, dim_union)  — L2-normalized
-        sparse_feat: (q, dim_sparse) — L2-normalized
-
-    Returns:
-        scalar loss
-
-    Note: dim_union và dim_sparse có thể khác nhau.
-          Dùng Global Average thay vì dot product trực tiếp.
-    """
-    # Dùng mean của absolute cosine similarity trên từng sample
-    # → project sparse về cùng space với union qua mean pooling
-    u = union_feat.mean(dim=1, keepdim=True)    # (q, 1) — magnitude đại diện
-    s = sparse_feat.mean(dim=1, keepdim=True)   # (q, 1)
-
-    # Cách đúng hơn: tính correlation giữa 2 vectors qua dot product
-    # (cả hai đã normalize → inner product = cosine sim)
-    # Vì dim khác nhau, dùng mean feature magnitude làm proxy
-    cos = (union_feat.mean(dim=1) * sparse_feat.mean(dim=1))  # (q,) — scalar proxy
-    return cos.abs().mean()
+def ortho_loss(union_feat, sparse_feat):
+    """Cross-covariance (Barlow Twins style). Minimize ||u^T s / N||_F^2."""
+    N = tf.cast(tf.shape(union_feat)[0], tf.float32)
+    cross = tf.matmul(tf.transpose(union_feat), sparse_feat) / N  # (D_inter, D_unique)
+    return tf.reduce_mean(tf.square(cross))
 
 
 # ===========================================================================
-# 6. NEGATIVE LOSS  (push core union features away from auxiliary images)
+# 6. NEGATIVE LOSS
 # ===========================================================================
 
-def neg_loss(union_feat: torch.Tensor,
-             union_neg: torch.Tensor,
-             margin: float = 0.5) -> torch.Tensor:
-    """
-    Đẩy union features của core images ra xa auxiliary (negative) images.
-    Giúp union features không bị "chung chung" với mọi ảnh.
-
-    L_neg = mean_{i,k} max(0, margin - cos(union_i, union_neg_k))
-
-    Args:
-        union_feat:  (q, dim_union)  — union features của core augmentations
-        union_neg:   (k, dim_union)  — union features của negative images
-        margin:      float           — minimum distance cần maintain
-
-    Returns:
-        scalar loss (0 nếu không có negative samples)
-    """
-    if union_neg is None or union_neg.size(0) == 0:
-        return torch.tensor(0.0, device=union_feat.device)
-
-    # cosine sim giữa mọi (core, neg) pair: (q, k)
-    sim = union_feat @ union_neg.T   # L2-norm → cosine sim
-    return F.relu(margin - sim).mean()
+def neg_loss(union_feat, union_neg, margin=0.5):
+    """Đẩy core union features ra xa negative images."""
+    if union_neg is None:
+        return tf.zeros((), dtype=tf.float32)
+    return tf.cond(
+        tf.equal(tf.size(union_neg), 0),
+        lambda: tf.zeros((), dtype=tf.float32),
+        lambda: tf.reduce_mean(tf.nn.relu(
+            margin - tf.matmul(union_feat, tf.transpose(union_neg))
+        )),
+    )
 
 
 # ===========================================================================
-# 7. COMBINED LOSS CLASS
+# 7. COMBINED LOSS
 # ===========================================================================
 
-class IntersectUnionLoss(nn.Module):
+class IntersectUnionLoss(keras.layers.Layer):
     """
-    Kết hợp tất cả loss thành 1 class để dùng trong trainer.
-
-    L_total = L_vae + λ_u·L_union + λ_s·L_sparse + λ_o·L_ortho + λ_n·L_neg
-
-    Vai trò của từng thành phần:
-        L_vae    → z latent có nghĩa tổng quát (reconstruction quality)
-        L_union  → union features bất biến qua augmentation
-        L_sparse → sparse features riêng biệt giữa các augmentation
-        L_ortho  → union và sparse không overlap thông tin
-        L_neg    → union features không bị overlap với unrelated images
+    L_total = L_vae + λ_u·L_union + λ_s·L_sparse + λ_o·L_ortho
+            + λ_n·L_neg + λ_uni·L_uniform + λ_aux·L_aux
     """
     def __init__(self,
-                 beta: float        = 1.0,
-                 lambda_union: float  = 1.0,
-                 lambda_sparse: float = 0.5,
-                 lambda_ortho: float  = 0.2,
-                 lambda_neg: float    = 0.3,
-                 lambda_uniform: float= 0.5,   # uniformity — chống collapse
-                 base_margin: float   = 0.5,
-                 neg_margin: float    = 0.5):
-        super().__init__()
-        self.beta           = beta
-        self.lambda_union   = lambda_union
-        self.lambda_sparse  = lambda_sparse
-        self.lambda_ortho   = lambda_ortho
-        self.lambda_neg     = lambda_neg
-        self.lambda_uniform = lambda_uniform
-        self.base_margin    = base_margin
-        self.neg_margin     = neg_margin
+                 beta=1.0, lambda_union=1.0, lambda_sparse=0.5,
+                 lambda_ortho=0.2, lambda_neg=0.3,
+                 lambda_uniform=0.5, lambda_aux=0.1,
+                 base_margin=0.5, neg_margin=0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.beta            = beta
+        self.lambda_union    = lambda_union
+        self.lambda_sparse   = lambda_sparse
+        self.lambda_ortho    = lambda_ortho
+        self.lambda_neg      = lambda_neg
+        self.lambda_uniform  = lambda_uniform
+        self.lambda_aux      = lambda_aux
+        self.base_margin     = base_margin
+        self.neg_margin      = neg_margin
 
-    def forward(self,
-                rec_img,          # Tensor hoặc None (khi skip_decoder=True)
-                img,              # Tensor hoặc None
-                mu: torch.Tensor,
-                logvar,           # Tensor hoặc None
-                image_feat: torch.Tensor,
-                union_feat: torch.Tensor,
-                sparse_feat: torch.Tensor,
-                union_neg: torch.Tensor = None):
-        """
-        rec_img / logvar = None  →  skip VAE loss (chỉ dùng contrastive losses).
-        """
-        # VAE loss — chỉ tính khi có decoder output
+    def call(self, rec_img, img, mu, logvar,
+             image_feat, union_feat, sparse_feat,
+             union_neg=None, q=3):
+        """rec_img / logvar = None → skip VAE loss."""
+        # Cast to float32 for numerical stability
+        union_feat  = tf.cast(union_feat,  tf.float32)
+        sparse_feat = tf.cast(sparse_feat, tf.float32)
+        image_feat  = tf.cast(image_feat,  tf.float32)
+
+        # VAE loss
         if rec_img is not None and logvar is not None:
+            rec_img  = tf.cast(rec_img,  tf.float32)
+            img      = tf.cast(img,      tf.float32)
+            mu       = tf.cast(mu,       tf.float32)
+            logvar   = tf.cast(logvar,   tf.float32)
             l_vae, l_mse, l_kl = vae_loss(rec_img, img, mu, logvar, self.beta)
         else:
-            zero      = torch.tensor(0.0, device=mu.device)
+            zero = tf.zeros((), dtype=tf.float32)
             l_vae, l_mse, l_kl = zero, zero, zero
 
-        # Intersect-Union losses
-        l_union   = union_loss(union_feat, image_feat)
-        l_sparse  = sparse_loss(sparse_feat, image_feat, self.base_margin)
+        l_union   = union_loss(union_feat, image_feat, q)
+        l_sparse  = sparse_loss(sparse_feat, image_feat, self.base_margin, q)
         l_ortho   = ortho_loss(union_feat, sparse_feat)
         l_neg     = neg_loss(union_feat, union_neg, self.neg_margin)
-        # Uniformity: chống collapse (quan trọng khi skip_decoder)
         l_uniform = uniformity_loss(union_feat) + uniformity_loss(sparse_feat)
+
+        if union_neg is not None:
+            union_neg_f = tf.cast(union_neg, tf.float32)
+            l_aux = tf.cond(
+                tf.equal(tf.size(union_neg_f), 0),
+                lambda: tf.zeros((), dtype=tf.float32),
+                lambda: uniformity_loss(union_neg_f),
+            )
+        else:
+            l_aux = tf.zeros((), dtype=tf.float32)
 
         total = (l_vae
                  + self.lambda_union   * l_union
                  + self.lambda_sparse  * l_sparse
                  + self.lambda_ortho   * l_ortho
                  + self.lambda_neg     * l_neg
-                 + self.lambda_uniform * l_uniform)
+                 + self.lambda_uniform * l_uniform
+                 + self.lambda_aux     * l_aux)
 
+        # Return TF scalars — caller converts to float only when needed (avoid per-step sync)
         details = {
-            'total':   total.item(),
-            'vae':     l_vae.item(),
-            'mse':     l_mse.item(),
-            'kl':      l_kl.item(),
-            'union':   l_union.item(),
-            'sparse':  l_sparse.item(),
-            'ortho':   l_ortho.item(),
-            'neg':     l_neg.item(),
-            'uniform': l_uniform.item(),
+            'total':   total,
+            'vae':     l_vae,
+            'mse':     l_mse,
+            'kl':      l_kl,
+            'union':   l_union,
+            'sparse':  l_sparse,
+            'ortho':   l_ortho,
+            'neg':     l_neg,
+            'uniform': l_uniform,
+            'aux':     l_aux,
         }
         return total, details
-
-
-# ===========================================================================
-# Quick test
-# ===========================================================================
-
-if __name__ == "__main__":
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}\n")
-
-    q, k, B = 3, 2, 4   # 3 augmentations, 2 negatives, batch=4
-    dim_union, dim_sparse, feat_dim = 128, 64, 64
-    latent_ch, H = 64, 8   # H/8 của ảnh 64×64
-
-    # Giả lập output của VAE
-    rec_img    = torch.sigmoid(torch.randn(B, 3, 64, 64)).to(device)
-    img        = torch.rand(B, 3, 64, 64).to(device)
-    mu         = torch.randn(B, latent_ch, H, H).to(device)
-    logvar     = torch.randn(B, latent_ch, H, H).to(device)
-    image_feat = F.normalize(torch.randn(B * q, feat_dim), dim=1).to(device)
-    union_feat = F.normalize(torch.randn(B * q, dim_union), dim=1).to(device)
-    sparse_feat= F.normalize(torch.randn(B * q, dim_sparse), dim=1).to(device)
-    union_neg  = F.normalize(torch.randn(B * k, dim_union), dim=1).to(device)
-
-    loss_fn = IntersectUnionLoss(
-        beta=1.0, lambda_union=1.0, lambda_sparse=0.5,
-        lambda_ortho=0.2, lambda_neg=0.3,
-        base_margin=0.5, neg_margin=0.5,
-    )
-
-    total, details = loss_fn(rec_img, img, mu, logvar,
-                             image_feat, union_feat, sparse_feat, union_neg)
-
-    print("Loss breakdown:")
-    for k_, v in details.items():
-        print(f"  {k_:<10}: {v:.4f}")
-
-    # Gradient test
-    union_feat2  = F.normalize(torch.randn(B * q, dim_union,  requires_grad=True), dim=1).to(device)
-    sparse_feat2 = F.normalize(torch.randn(B * q, dim_sparse, requires_grad=True), dim=1).to(device)
-    total2, _ = loss_fn(rec_img, img, mu, logvar,
-                        image_feat, union_feat2, sparse_feat2, union_neg)
-    total2.backward()
-    print(f"\nGradient flow: union_feat.grad={union_feat2.grad is not None} ✓")

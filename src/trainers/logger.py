@@ -17,6 +17,7 @@ class Logger:
         self.losses_path      = os.path.join(run_dir, 'losses.csv')
         self.metrics_path     = os.path.join(run_dir, 'metrics.csv')
         self.iter_losses_path = os.path.join(run_dir, 'iter_losses.csv')
+        self.probe_path       = os.path.join(run_dir, 'probe_results.csv')
 
         with open(self.losses_path, 'w', newline='') as f:
             csv.writer(f).writerow(
@@ -33,6 +34,11 @@ class Logger:
                 ['global_iter','epoch','batch',
                  'total','union','sparse','ortho','neg','uniform',
                  'union_consistency','sparse_divergence','ortho_score','lr'])
+
+        with open(self.probe_path, 'w', newline='') as f:
+            csv.writer(f).writerow(
+                ['epoch','dataset','top1','top5',
+                 'probe_epochs','n_train','n_test','time_s'])
 
     # ------------------------------------------------------------------
     def _write(self, msg: str):
@@ -240,6 +246,32 @@ class Logger:
                 f"{metrics['sparse_divergence']:.6f}",
                 f"{metrics['ortho_score']:.6f}",
                 f"{metrics['recon_psnr']:.4f}",
+            ])
+
+    # ------------------------------------------------------------------
+    def log_probe(self, epoch: int, result: dict, dataset: str = 'cifar10',
+                  probe_epochs: int = 20):
+        sep = '=' * 62
+        bar = '-' * 62
+        msg = (
+            f"\n{sep}\n"
+            f"  [LinearProbe] Epoch {epoch}  dataset={dataset}\n"
+            f"{bar}\n"
+            f"  top-1 accuracy : {result['top1']:.2f}%\n"
+            f"  top-5 accuracy : {result['top5']:.2f}%\n"
+            f"  n_train        : {result['n_train']:,}\n"
+            f"  n_test         : {result['n_test']:,}\n"
+            f"  time           : {result['time_s']:.0f}s\n"
+            f"{sep}"
+        )
+        self._write(msg)
+
+        with open(self.probe_path, 'a', newline='') as f:
+            csv.writer(f).writerow([
+                epoch, dataset,
+                f"{result['top1']:.2f}", f"{result['top5']:.2f}",
+                probe_epochs, result['n_train'], result['n_test'],
+                f"{result['time_s']:.1f}",
             ])
 
     def info(self, msg: str):

@@ -1,182 +1,179 @@
 """
-main.py — Entry point training
+main.py — Entry point training (TensorFlow)
 
 Cách dùng:
     python main.py
-    python main.py --dataset coco --epochs 20 --batch-size 16
-    python main.py --dataset cifar10 --img-size 32 --batch-size 64
-    python main.py --resume experiments/run_xxx/checkpoints/checkpoint_latest.pt
+
+Chỉnh cấu hình trực tiếp ở phần CONFIG bên dưới.
 """
 
-import argparse
-import torch
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'   # ẩn TF info logs
+
+import tensorflow as tf
 
 from src.models.VAE import VAE
-from src.models.encoders import build_encoder, ENCODER_REGISTRY
+from src.models.encoders import build_encoder
 from src.losses.losses import IntersectUnionLoss
 from src.trainers.trainer import Trainer, TrainConfig
-from src.utils.xla_utils import get_device, is_tpu, device_str, setup_tpu
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
+# ===========================================================================
+# CONFIG — chỉnh trực tiếp ở đây
+# ===========================================================================
 
-    # Data
-    p.add_argument('--dataset',   type=str, default='coco',
-                   choices=['coco', 'cifar10', 'cifar100', 'stl10', 'imagenet'])
-    p.add_argument('--data-root', type=str, default=None)
-    p.add_argument('--img-size',  type=int, default=None)
+ENCODER      = 'gated_vae'   # 'gated_vae' | 'resnet50' | 'resnet18' | 'efficientnet' | 'mobilenet'
+DATASET      = 'imagenet'    # 'imagenet' | 'coco' | 'cifar10' | 'cifar100'
+IMG_SIZE     = 128
+DATA_ROOT    = None           # None = dùng default
 
-    # Training
-    p.add_argument('--epochs',     type=int,   default=20)
-    p.add_argument('--batch-size', type=int,   default=64)   # peak ~6.5GB với grad_checkpoint
-    p.add_argument('--grad-accum', type=int,   default=1)
-    p.add_argument('--lr',         type=float, default=3e-4)
-    p.add_argument('--workers',    type=int,   default=8)
-    p.add_argument('--prefetch',   type=int,   default=2,
-                   help='DataLoader prefetch_factor (dùng 4+ cho ImageNet)')
-    p.add_argument('--q',          type=int,   default=3)
-    p.add_argument('--k',          type=int,   default=2,
-                   help='Số negative samples (0 = in-batch negatives, nhanh hơn cho ImageNet)')
-    p.add_argument('--device',     type=str,   default=device_str(),
-                   help='cuda | cpu | xla (TPU — tự động detect nếu torch_xla available)')
-    p.add_argument('--no-amp',     action='store_true')
-    p.add_argument('--compile',    action='store_true')
-    p.add_argument('--log-iter-every', type=int, default=50,
-                   help='Log per-iteration metrics every N iterations (0 = disable)')
-    p.add_argument('--skip-decoder',action='store_true',
-                   help='Bỏ qua VAE decoder+KL, chỉ train contrastive losses (nhanh hơn, ít VRAM)')
+EPOCHS       = 30
+BATCH_SIZE   = 32
+GRAD_ACCUM   = 1
+LR           = 3e-4
+WORKERS      = 8
+PREFETCH     = 4
 
-    # Loss weights
-    p.add_argument('--beta',          type=float, default=0.1)
-    p.add_argument('--lambda-union',  type=float, default=1.0)
-    p.add_argument('--lambda-sparse', type=float, default=0.5)
-    p.add_argument('--lambda-ortho',  type=float, default=0.1)
-    p.add_argument('--lambda-neg',    type=float, default=0.3)
+USE_AMP      = True
+SKIP_DECODER = True           # False = bật VAE decoder+KL
 
-    # Model
-    p.add_argument('--encoder',    type=str, default='gated_vae',
-                   choices=list(ENCODER_REGISTRY.keys()),
-                   help='Backbone encoder để so sánh: gated_vae | resnet18 | resnet50 | efficientnet | mobilenet')
-    p.add_argument('--pretrained', action='store_true', default=True,
-                   help='Dùng ImageNet pretrained weights cho encoder (không áp dụng với gated_vae)')
-    p.add_argument('--latent-ch',  type=int, default=2048)
-    p.add_argument('--dim-inter',  type=int, default=1024)
-    p.add_argument('--dim-unique', type=int, default=1024)
+Q = 3   # số augmentation views
+K = 0   # negative samples (0 = in-batch)
 
-    # Misc
-    p.add_argument('--run-name', type=str, default=None)
-    p.add_argument('--exp-dir',  type=str, default='experiments')
-    p.add_argument('--resume',   type=str, default=None)
-    p.add_argument('--seed',     type=int, default=42)
+# Model dims — DIM_INTER + DIM_UNIQUE phải == LATENT_CH
+LATENT_CH    = 192   # 128 + 64
+DIM_INTER    = 128
+DIM_UNIQUE   = 64
 
-    return p.parse_args()
+# Loss weights
+BETA          = 0.1
+LAMBDA_UNION  = 1.0
+LAMBDA_SPARSE = 0.5
+LAMBDA_ORTHO  = 0.1
+LAMBDA_NEG    = 0.3
 
+WARMUP_EPOCHS = 5
+
+# Linear probe evaluation
+EVAL_EVERY        = 10
+EVAL_DATASET      = 'coco'
+EVAL_DATA_ROOT    = 'data/coco2017'   # root chứa train2017/, val2017/, annotations/
+EVAL_PROBE_EPOCHS = 20
+
+# Misc
+SEED     = 42
+EXP_DIR  = 'experiments'
+RUN_NAME = None   # None = tự động
+
+
+# ===========================================================================
+# Dataset defaults
+# ===========================================================================
 
 DATASET_DEFAULTS = {
-    'coco':     {'data_root': 'data/coco2017',  'img_size': 128},
-    'cifar10':  {'data_root': 'data',           'img_size': 32},
-    'cifar100': {'data_root': 'data',           'img_size': 32},
-    'stl10':    {'data_root': 'data',           'img_size': 96},
-    'imagenet': {'data_root': 'data/imagenet',  'img_size': 224},
-    # ImageNet recommended: --batch-size 32 --grad-accum 8  (eff_batch=256)
+    'imagenet': {'data_root': 'data/imagenet',       'img_size': 128},
+    'coco':     {'data_root': 'data/coco2017',        'img_size': 128},
+    'cifar10':  {'data_root': 'data',                 'img_size': 32},
+    'cifar100': {'data_root': 'data',                 'img_size': 32},
 }
 
 
 def main():
-    args = parse_args()
-    torch.manual_seed(args.seed)
+    tf.random.set_seed(SEED)
 
-    # TPU v5e: set env vars (BF16) TRUOC khi tao model
-    # SPMD=False: Kaggle TPU v5e-8 khong ho tro xr.use_spmd() theo cach nay
-    if is_tpu():
-        setup_tpu(use_bf16=True, use_spmd=False)
+    defaults  = DATASET_DEFAULTS[DATASET]
+    data_root = DATA_ROOT or defaults['data_root']
+    img_size  = IMG_SIZE  or defaults['img_size']
+    run_name  = RUN_NAME  or f"{ENCODER}_{DATASET}_is{img_size}"
 
-    defaults  = DATASET_DEFAULTS[args.dataset]
-    data_root = args.data_root or defaults['data_root']
-    img_size  = args.img_size  or defaults['img_size']
-    run_name  = args.run_name  or f"{args.encoder}_{args.dataset}_is{img_size}"
-    # TPU: dùng get_device() từ xla_utils; GPU/CPU: dùng args.device
-    device = get_device() if is_tpu() else torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    gpus = tf.config.list_physical_devices('GPU')
+    device_str = f"GPU × {len(gpus)}" if gpus else "CPU"
 
     print(f"\n{'='*55}")
-    print(f"Encoder : {args.encoder}")
-    print(f"Dataset : {args.dataset}  ({data_root})")
-    print(f"Img size: {img_size}x{img_size}   Device: {device}")
-    print(f"Epochs  : {args.epochs}   LR: {args.lr}   Batch: {args.batch_size} x {args.grad_accum}")
+    print(f"Framework: TensorFlow {tf.__version__}")
+    print(f"Encoder  : {ENCODER}")
+    print(f"Dataset  : {DATASET}  ({data_root})")
+    print(f"Img size : {img_size}x{img_size}   Device: {device_str}")
+    print(f"Epochs   : {EPOCHS}   LR: {LR}   Batch: {BATCH_SIZE} x {GRAD_ACCUM}")
     print(f"{'='*55}\n")
 
     # Build model
-    if args.encoder == 'gated_vae':
+    if ENCODER == 'gated_vae':
         if img_size >= 128:
+            # Stage 1 nhỏ (128×128 spatial là bottleneck) → stage 3 to (32×32, rẻ)
+            # Peak tensor: (B*q, 128, 128, 96) ≈ 150 MB  →  tổng ~6 GB trên 3060 12GB
             model = VAE(
-                s1_out=16, s1_heads=4,  s1_blocks=1,
-                s2_out=16, s2_heads=8,  s2_blocks=2,
-                s3_out=16, s3_heads=16, s3_blocks=2,
-                latent_ch=args.latent_ch,
+                s1_out=8,  s1_heads=4,  s1_blocks=1,   # 32ch tại 128×128
+                s2_out=8,  s2_heads=8,  s2_blocks=2,   # 64ch tại 64×64
+                s3_out=16, s3_heads=16, s3_blocks=2,   # 256ch tại 32×32
+                latent_ch=LATENT_CH,
                 dec_ch3=128, dec_ch2=64, dec_ch1=32,
-                dim_inter=args.dim_inter, dim_unique=args.dim_unique,
+                dim_inter=DIM_INTER, dim_unique=DIM_UNIQUE,
                 feat_dim=64, hidden_dim=256,
             )
         else:
+            # ch progression: 16 → 32 → 128
             model = VAE(
-                s1_out=8, s1_heads=4,  s1_blocks=1,
-                s2_out=8, s2_heads=8,  s2_blocks=2,
-                s3_out=8, s3_heads=16, s3_blocks=2,
-                latent_ch=args.latent_ch // 2,
+                s1_out=4,  s1_heads=4,  s1_blocks=1,
+                s2_out=4,  s2_heads=8,  s2_blocks=2,
+                s3_out=8,  s3_heads=16, s3_blocks=2,
+                latent_ch=LATENT_CH // 2,
                 dec_ch3=64, dec_ch2=32, dec_ch1=16,
-                dim_inter=args.dim_inter // 2, dim_unique=args.dim_unique // 2,
+                dim_inter=DIM_INTER // 2, dim_unique=DIM_UNIQUE // 2,
                 feat_dim=32, hidden_dim=128,
             )
     else:
         model = build_encoder(
-            name        = args.encoder,
-            latent_ch   = args.latent_ch,
-            dim_inter   = args.dim_inter,
-            dim_unique  = args.dim_unique,
-            pretrained  = args.pretrained,
+            name       = ENCODER,
+            latent_ch  = LATENT_CH,
+            dim_inter  = DIM_INTER,
+            dim_unique = DIM_UNIQUE,
+            pretrained = True,
         )
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Warm-up build with dummy input
+    dummy = tf.zeros((2, img_size, img_size, 3))
+    model(dummy, skip_decoder=True, training=False)
+    n_params = model.count_parameters()
     print(f"Model params: {n_params:,}\n")
 
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location='cpu')
-        model.load_state_dict(ckpt['model_state_dict'])
-        print(f"Resumed from epoch {ckpt.get('epoch', '?')}: {args.resume}\n")
-
     loss_fn = IntersectUnionLoss(
-        beta          = args.beta,
-        lambda_union  = args.lambda_union,
-        lambda_sparse = args.lambda_sparse,
-        lambda_ortho  = args.lambda_ortho,
-        lambda_neg    = args.lambda_neg,
+        beta          = BETA,
+        lambda_union  = LAMBDA_UNION,
+        lambda_sparse = LAMBDA_SPARSE,
+        lambda_ortho  = LAMBDA_ORTHO,
+        lambda_neg    = LAMBDA_NEG,
     )
 
     cfg = TrainConfig(
         run_name      = run_name,
-        exp_dir       = args.exp_dir,
+        exp_dir       = EXP_DIR,
         data_root     = data_root,
-        dataset       = args.dataset,
+        dataset       = DATASET,
         img_size      = img_size,
-        q             = args.q,
-        k             = args.k,
-        batch_size    = args.batch_size,
-        grad_accum    = args.grad_accum,
-        num_workers   = args.workers,
-        prefetch_factor = args.prefetch,
-        device        = str(device),
-        use_amp       = not args.no_amp,
-        compile_model = args.compile,
-        use_vae       = not args.skip_decoder,
-        total_epochs  = args.epochs,
-        lr            = args.lr,
-        beta          = args.beta,
-        lambda_union  = args.lambda_union,
-        lambda_sparse = args.lambda_sparse,
-        lambda_ortho  = args.lambda_ortho,
-        lambda_neg    = args.lambda_neg,
-        log_iter_every = args.log_iter_every,
+        q             = Q,
+        k             = K,
+        batch_size    = BATCH_SIZE,
+        grad_accum    = GRAD_ACCUM,
+        num_workers   = WORKERS,
+        prefetch_factor = PREFETCH,
+        use_amp       = USE_AMP,
+        use_vae       = not SKIP_DECODER,
+        total_epochs  = EPOCHS,
+        lr            = LR,
+        warmup_epochs = WARMUP_EPOCHS,
+        beta          = BETA,
+        lambda_union  = LAMBDA_UNION,
+        lambda_sparse = LAMBDA_SPARSE,
+        lambda_ortho  = LAMBDA_ORTHO,
+        lambda_neg    = LAMBDA_NEG,
+        eval_every        = EVAL_EVERY,
+        eval_dataset      = EVAL_DATASET,
+        eval_data_root    = EVAL_DATA_ROOT,
+        eval_probe_epochs = EVAL_PROBE_EPOCHS,
+        dim_inter         = DIM_INTER,
+        dim_unique        = DIM_UNIQUE,
+        latent_ch         = LATENT_CH,
     )
 
     Trainer(model, loss_fn, cfg).train()
