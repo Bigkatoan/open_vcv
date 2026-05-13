@@ -87,9 +87,10 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    # TPU v5e: khởi tạo SPMD + bfloat16 trước tất cả operations khác
+    # TPU v5e: set env vars (BF16) TRUOC khi tao model
+    # SPMD=False: Kaggle TPU v5e-8 khong ho tro xr.use_spmd() theo cach nay
     if is_tpu():
-        setup_tpu(use_bf16=True, use_spmd=True)
+        setup_tpu(use_bf16=True, use_spmd=False)
 
     defaults  = DATASET_DEFAULTS[args.dataset]
     data_root = args.data_root or defaults['data_root']

@@ -62,32 +62,32 @@ def spmd_available() -> bool:
 
 # ── TPU Setup ─────────────────────────────────────────────────────────────────
 
-def setup_tpu(use_bf16: bool = True, use_spmd: bool = True):
+def setup_tpu(use_bf16: bool = True, use_spmd: bool = False):
     """
-    Khởi tạo TPU v5e-8 với các tối ưu tốt nhất.
-    Gọi 1 lần ở đầu script trước khi tạo model / dataloader.
+    Khởi tạo TPU v5e-8. Gọi 1 lần ở đầu script TRUOC khi tao model.
 
-    use_bf16 : dùng bfloat16 — native trên v5e, nhanh hơn float32 ~2×
-    use_spmd : bật SPMD parallelism — tự shard batch qua 8 cores
+    use_bf16 : bfloat16 native tren v5e (nhanh hon float32 ~2x)
+    use_spmd : SPMD parallelism — chi bat neu biet chac Kaggle ho tro.
+               Mac dinh False vi xr.use_spmd() co the crash tren Kaggle.
     """
     if not _XLA_AVAILABLE:
         return  # GPU/CPU: no-op
 
+    # Env vars phai set TRUOC khi bat ky XLA op nao chay
     if use_bf16:
-        # XLA_USE_BF16=1: tự động cast float32 ops sang bfloat16 trên TPU
         os.environ['XLA_USE_BF16'] = '1'
-        # Tắt downcast cảnh báo
         os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 
     if use_spmd and _SPMD_AVAILABLE:
-        # SPMD mode: 1 process điều khiển 8 cores
-        # Tốt hơn multiprocessing cho v5e (ít overhead hơn)
-        xr.use_spmd()
-        xla_print(f"[TPU] SPMD mode enabled — {xr.global_device_count()} devices")
+        try:
+            xr.use_spmd()
+            print(f"[TPU] SPMD mode enabled")
+        except Exception as e:
+            print(f"[TPU] SPMD unavailable ({e}), using single-device mode")
     else:
-        xla_print(f"[TPU] Single-process mode")
+        print("[TPU] Single-device mode (SPMD disabled)")
 
-    xla_print(f"[TPU] v5e-8 ready | BF16={use_bf16} | SPMD={use_spmd and _SPMD_AVAILABLE}")
+    print(f"[TPU] Setup done | BF16={use_bf16} | SPMD={use_spmd and _SPMD_AVAILABLE}")
 
 
 def get_device() -> torch.device:
@@ -234,10 +234,13 @@ def is_master() -> bool:
 
 
 def xla_print(*args):
-    """Print chi tu master core (tranh 8 cores print cung luc)."""
+    """Print chi tu master core. Fallback ve print thuong neu device chua init."""
     if _XLA_AVAILABLE:
-        if xm.is_master_ordinal():
-            print(*args)
+        try:
+            if xm.is_master_ordinal():
+                print(*args)
+        except Exception:
+            print(*args)  # device chua init — print binh thuong
     else:
         print(*args)
 
