@@ -42,6 +42,8 @@ def parse_args():
                    help='cuda | cpu | xla (TPU — tự động detect nếu torch_xla available)')
     p.add_argument('--no-amp',     action='store_true')
     p.add_argument('--compile',    action='store_true')
+    p.add_argument('--log-iter-every', type=int, default=50,
+                   help='Log per-iteration metrics every N iterations (0 = disable)')
     p.add_argument('--skip-decoder',action='store_true',
                    help='Bỏ qua VAE decoder+KL, chỉ train contrastive losses (nhanh hơn, ít VRAM)')
 
@@ -173,6 +175,7 @@ def main():
         lambda_sparse = args.lambda_sparse,
         lambda_ortho  = args.lambda_ortho,
         lambda_neg    = args.lambda_neg,
+        log_iter_every = args.log_iter_every,
     )
 
     Trainer(model, loss_fn, cfg).train()
