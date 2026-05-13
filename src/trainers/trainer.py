@@ -145,12 +145,15 @@ class Trainer:
         else:
             self.scaler = None
 
-        if cfg.compile_model:
+        # torch.compile: tự động bật trên CUDA nếu PyTorch >= 2.0 và được yêu cầu.
+        # Cho ~20-40% speedup trên RTX series. Không dùng cho TPU (XLA tự JIT).
+        should_compile = cfg.compile_model and not is_tpu() and torch.cuda.is_available()
+        if should_compile:
             try:
                 self.model = torch.compile(self.model, mode='reduce-overhead')
-                self.logger.info('torch.compile: ON (reduce-overhead)')
+                print('[Trainer] torch.compile: ON (reduce-overhead) — first iter sẽ chậm hơn')
             except Exception as e:
-                self.logger.info(f'torch.compile unavailable: {e}')
+                print(f'[Trainer] torch.compile unavailable: {e}')
 
         self._write_config()
 
@@ -197,28 +200,19 @@ class Trainer:
         print(f"[Data] Dataset ready: {len(base):,} samples")
         ds = AugmentedDataset(base, q=cfg.q, k=cfg.k, img_size=cfg.img_size)
 
-        # TPU: workers > 0 co the deadlock voi MpDeviceLoader -> force 0
+        # TPU: workers > 0 can deadlock with MpDeviceLoader → force 0
         nw = 0 if is_tpu() else cfg.num_workers
         pf = cfg.prefetch_factor if nw > 0 else None
 
-        # CUDA + fork = deadlock khi CUDA đã init trước khi spawn workers.
-        # Dùng 'spawn' để tránh — workers khởi động lại từ đầu (an toàn).
-        # Nếu nw=0 thì không spawn gì cả.
-        mp_ctx = None
-        if nw > 0 and torch.cuda.is_initialized():
-            mp_ctx = 'spawn'
-            print(f"[Data] Using multiprocessing_context='spawn' (CUDA pre-initialized)")
-
         loader = DataLoader(
             ds,
-            batch_size             = cfg.batch_size,
-            shuffle                = True,
-            num_workers            = nw,
-            prefetch_factor        = pf,
-            pin_memory             = not is_tpu(),
-            drop_last              = True,
-            persistent_workers     = nw > 0,
-            multiprocessing_context= mp_ctx,
+            batch_size         = cfg.batch_size,
+            shuffle            = True,
+            num_workers        = nw,
+            prefetch_factor    = pf,
+            pin_memory         = not is_tpu(),
+            drop_last          = True,
+            persistent_workers = nw > 0,
         )
         print(f"[Data] DataLoader ready | workers={nw} prefetch={pf} pin_memory={not is_tpu()}")
         # Wrap với XLA MpDeviceLoader trên TPU để pipeline data → device

@@ -27,6 +27,7 @@ notebooks/**/*.ipynb
 !notebooks/kaggle_tpu.ipynb
 !notebooks/kaggle_tpu_v5e.ipynb
 !notebooks/kaggle_t4x2.ipynb
+!notebooks/local_train.ipynb
 
 # IDE
 .vscode/settings.json
