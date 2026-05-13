@@ -225,11 +225,93 @@ python -m pytest tests/ -v
 
 ## Cấu hình nhanh theo GPU
 
-| GPU VRAM | `BATCH_SIZE` | `IMG_SIZE` | Ghi chú |
-|----------|-------------|-----------|---------|
-| 4 GB | 16 | 128 | OK |
-| 8 GB | 32 | 128 | OK |
-| 12 GB (3060) | 64 | 128 | Recommended |
-| 24 GB | 128 | 128 | Tốt nhất |
+| GPU | VRAM | `BATCH_SIZE` | `IMG_SIZE` | `USE_AMP` | Ghi chú |
+|-----|------|-------------|-----------|-----------|---------|
+| GTX 1080 Ti | 11 GB | 32 | 128 | `True` (fp16) | OK |
+| RTX 3060 | 12 GB | 64 | 128 | `True` (fp16) | Recommended |
+| RTX 3090 / 4090 | 24 GB | 128 | 224 | `True` (fp16) | Full ImageNet size |
+| **H100 SXM5** | **80 GB** | **512** | **224** | `True` (**bf16**) | Xem phần dưới |
+| H100 × 8 (node) | 640 GB | 4096 | 224 | `True` (bf16) | Multi-GPU |
 
 > Tăng `BATCH_SIZE` giúp in-batch negatives đa dạng hơn → contrastive learning tốt hơn.
+
+---
+
+## H100 — Cấu hình tối ưu
+
+H100 hỗ trợ **bfloat16** (ổn định số học hơn float16, không bị underflow gradient) và **NVLink** cho multi-GPU. Cần 3 thay đổi so với config mặc định:
+
+### 1. Đổi precision sang bfloat16
+
+Trong `main.py`, tìm `USE_AMP = True` và đổi policy trong `xla_utils.py`, hoặc thêm dòng này vào đầu `main()`:
+
+```python
+# main.py — thêm sau import tensorflow as tf
+import keras
+keras.mixed_precision.set_global_policy('mixed_bfloat16')   # H100: dùng bf16 thay fp16
+```
+
+Và tắt `USE_AMP` để tránh set lại fp16:
+
+```python
+USE_AMP = False   # đã set bf16 thủ công ở trên
+```
+
+### 2. Config cho single H100 (80 GB)
+
+```python
+BATCH_SIZE   = 512
+IMG_SIZE     = 224
+EPOCHS       = 100          # H100 nhanh, train lâu hơn để hội tụ
+LR           = 1e-3         # scale LR theo batch: LR_base × (batch / 256)
+WARMUP_EPOCHS = 10
+
+# Model lớn hơn — H100 80GB chứa thoải mái
+LATENT_CH    = 384          # 256 + 128
+DIM_INTER    = 256
+DIM_UNIQUE   = 128
+```
+
+Và trong `main()`, dùng model lớn hơn:
+
+```python
+model = VAE(
+    s1_out=16, s1_heads=4,  s1_blocks=2,   # 64ch tại 224×224
+    s2_out=16, s2_heads=8,  s2_blocks=3,   # 128ch tại 112×112
+    s3_out=16, s3_heads=16, s3_blocks=3,   # 256ch tại 56×56  ← thêm 1 stage vì IMG=224
+    latent_ch=LATENT_CH,
+    dec_ch3=256, dec_ch2=128, dec_ch1=64,
+    dim_inter=DIM_INTER, dim_unique=DIM_UNIQUE,
+    feat_dim=128, hidden_dim=512,
+)
+```
+
+### 3. Multi-GPU (H100 × N)
+
+`MirroredStrategy` tự động chia batch qua các GPU, không cần sửa model:
+
+```python
+# main.py — thêm trước khi build model
+import tensorflow as tf
+strategy = tf.distribute.MirroredStrategy()   # tự detect tất cả GPU
+print(f"Running on {strategy.num_replicas_in_sync} GPUs")
+
+with strategy.scope():
+    model   = VAE(...)
+    loss_fn = IntersectUnionLoss(...)
+    cfg     = TrainConfig(
+        batch_size = 512 * strategy.num_replicas_in_sync,  # global batch
+        ...
+    )
+    Trainer(model, loss_fn, cfg).train()
+```
+
+> Với 8× H100 (node): `batch_size = 4096`, LR ~ `4e-3` (linear scaling rule).
+
+### Ước tính tốc độ
+
+| Setup | steps/s | Thời gian / epoch (ImageNet) | 100 epochs |
+|-------|---------|------------------------------|------------|
+| RTX 3060 (batch 64, fp16) | ~8 | ~45 min | ~75 h |
+| H100 SXM5 (batch 512, bf16) | ~180 | ~2 min | ~3.3 h |
+| 8× H100 (batch 4096, bf16) | ~900 | ~25 s | ~42 min |
