@@ -128,7 +128,8 @@ def bf16_context():
         with torch.autocast('xla', dtype=torch.bfloat16):
             yield
     elif torch.cuda.is_available():
-        with torch.amp.autocast('cuda', dtype=torch.float16):
+        # torch.autocast works on PyTorch >= 1.10; torch.amp.autocast only >= 2.3
+        with torch.autocast('cuda', dtype=torch.float16):
             yield
     else:
         yield

@@ -138,7 +138,12 @@ class Trainer:
         # TPU v5e: dùng bfloat16 qua bf16_context() thay cho GradScaler/AMP
         # GPU: dùng float16 GradScaler như cũ
         use_amp_gpu = cfg.use_amp and not is_tpu()
-        self.scaler = torch.amp.GradScaler('cuda') if use_amp_gpu else None
+        # torch.cuda.amp.GradScaler works on PyTorch >= 1.6 (including Kaggle 2.1.x)
+        # torch.amp.GradScaler only available on PyTorch >= 2.3
+        if use_amp_gpu:
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
 
         if cfg.compile_model:
             try:
