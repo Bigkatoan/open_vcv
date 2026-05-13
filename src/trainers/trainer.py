@@ -173,6 +173,7 @@ class Trainer:
     # ------------------------------------------------------------------
     def _build_loader(self):
         cfg = self.cfg
+        print(f"[Data] Loading dataset '{cfg.dataset}' from {cfg.data_root} ...")
         if cfg.dataset == 'coco':
             from src.datasets.aug_dataset import CocoImageDataset
             base = CocoImageDataset(root=cfg.data_root, split='train')
@@ -187,27 +188,39 @@ class Trainer:
                                download=False, transform=None)
         elif cfg.dataset == 'imagenet':
             import torchvision.datasets as _dsets
+            # ImageFolder scans 1.2M files — có thể mất 2-5 phút trên Kaggle NFS
+            print("[Data] Scanning ImageNet directory (may take 2-5 min on Kaggle)...")
             base = _dsets.ImageFolder(root=cfg.data_root, transform=None)
         else:
             raise ValueError(f"Unknown dataset: {cfg.dataset}")
 
+        print(f"[Data] Dataset ready: {len(base):,} samples")
         ds = AugmentedDataset(base, q=cfg.q, k=cfg.k, img_size=cfg.img_size)
-        # ImageNet: prefetch nhiều hơn để GPU không bị stall chờ data
-        pf = cfg.prefetch_factor
-        if cfg.dataset == 'imagenet' and cfg.num_workers > 0 and not is_tpu():
-            pf = max(pf, 4)
+
         # TPU: workers > 0 co the deadlock voi MpDeviceLoader -> force 0
         nw = 0 if is_tpu() else cfg.num_workers
+        pf = cfg.prefetch_factor if nw > 0 else None
+
+        # CUDA + fork = deadlock khi CUDA đã init trước khi spawn workers.
+        # Dùng 'spawn' để tránh — workers khởi động lại từ đầu (an toàn).
+        # Nếu nw=0 thì không spawn gì cả.
+        mp_ctx = None
+        if nw > 0 and torch.cuda.is_initialized():
+            mp_ctx = 'spawn'
+            print(f"[Data] Using multiprocessing_context='spawn' (CUDA pre-initialized)")
+
         loader = DataLoader(
             ds,
-            batch_size      = cfg.batch_size,
-            shuffle         = True,
-            num_workers     = nw,
-            prefetch_factor = pf if nw > 0 else None,
-            pin_memory      = not is_tpu(),
-            drop_last       = True,
-            persistent_workers = nw > 0,
+            batch_size             = cfg.batch_size,
+            shuffle                = True,
+            num_workers            = nw,
+            prefetch_factor        = pf,
+            pin_memory             = not is_tpu(),
+            drop_last              = True,
+            persistent_workers     = nw > 0,
+            multiprocessing_context= mp_ctx,
         )
+        print(f"[Data] DataLoader ready | workers={nw} prefetch={pf} pin_memory={not is_tpu()}")
         # Wrap với XLA MpDeviceLoader trên TPU để pipeline data → device
         return wrap_dataloader(loader, self.device)
 
