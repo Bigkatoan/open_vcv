@@ -131,6 +131,10 @@ class Trainer:
             self.model = self.model.to(memory_format=torch.channels_last)
             torch.backends.cudnn.benchmark = True
         os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+        # Multi-GPU (T4 x2): DataParallel tu dong chia batch qua cac GPU
+        if not is_tpu() and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
+            self.logger.info(f'DataParallel: {torch.cuda.device_count()} GPUs')
         # TPU v5e: dùng bfloat16 qua bf16_context() thay cho GradScaler/AMP
         # GPU: dùng float16 GradScaler như cũ
         use_amp_gpu = cfg.use_amp and not is_tpu()
@@ -187,15 +191,17 @@ class Trainer:
         pf = cfg.prefetch_factor
         if cfg.dataset == 'imagenet' and cfg.num_workers > 0 and not is_tpu():
             pf = max(pf, 4)
+        # TPU: workers > 0 co the deadlock voi MpDeviceLoader -> force 0
+        nw = 0 if is_tpu() else cfg.num_workers
         loader = DataLoader(
             ds,
             batch_size      = cfg.batch_size,
             shuffle         = True,
-            num_workers     = cfg.num_workers,
-            prefetch_factor = pf if cfg.num_workers > 0 else None,
-            pin_memory      = not is_tpu(),   # TPU dùng MpDeviceLoader thay pin_memory
+            num_workers     = nw,
+            prefetch_factor = pf if nw > 0 else None,
+            pin_memory      = not is_tpu(),
             drop_last       = True,
-            persistent_workers = cfg.num_workers > 0 and not is_tpu(),
+            persistent_workers = nw > 0,
         )
         # Wrap với XLA MpDeviceLoader trên TPU để pipeline data → device
         return wrap_dataloader(loader, self.device)
